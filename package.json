@@ -11,6 +11,7 @@
   "description": "",
   "dependencies": {
     "dotenv": "^17.4.2",
+    "mysql2": "^3.22.3",
     "playwright": "^1.59.1"
   }
 }
