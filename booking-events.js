@@ -49,6 +49,9 @@ async function run() {
   log('Setting EventType = 3 (Logged as Complete)...');
   await page.selectOption('#EventType', '3');
 
+  log('Clicking Today button...');
+  await page.click('div[align="center"]:has-text("Today")');
+
   log('Running report...');
   await page.click('#showReport-0');
 
