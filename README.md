@@ -1,79 +1,100 @@
 # ClubReady Report Automation
 
-Headless Playwright script that logs into ClubReady, runs a report, and downloads it as a CSV. Ships as a Docker container — no Node.js, Playwright, or browser install required.
+Headless Playwright scripts that log into ClubReady, extract data, and either download it as CSV or write it directly to MySQL. Runs via Node.js on the server — triggered by n8n on a schedule.
 
 ---
 
-## Quick Start (Docker)
+## Scripts
 
-### 1. Install Docker
+| Script | Output | Schedule |
+|---|---|---|
+| `completed-classes.js` | CSV → Google Drive | Daily 7am ET |
+| `booking-events.js` | CSV → Google Drive | Daily |
+| `frozen-members.js` | CSV → Google Drive | Daily |
+| `member-list.js` | CSV → Google Drive | Daily |
+| `lead-activity.js` | MySQL `lead_management_activity` | Daily 2:30am ET |
 
-Download and install [Docker Desktop](https://www.docker.com/products/docker-desktop/).
+---
 
-### 2. Build the image
+## Quick Start
+
+### 1. Install dependencies
 
 ```bash
-docker build -t clubready-reports .
+npm install
+npx playwright install chromium
 ```
 
-This downloads the base image (~1.5 GB on first run) and installs dependencies. Subsequent builds are fast.
-
-### 3. Create your credentials file
-
-Copy the example and fill in your ClubReady login:
+### 2. Create your credentials file
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env`:
+Edit `.env` with your ClubReady login and (for `lead-activity.js`) MySQL credentials.
 
-```
-CLUBREADY_USER=your_username
-CLUBREADY_PASS="your_password"   # keep the quotes — required if password contains #
-DOWNLOAD_DIR=/output
-```
-
-### 4. Run it
+### 3. Run a script
 
 ```bash
-docker run --rm \
-  --env-file .env \
-  -v "$(pwd)/output:/output" \
-  clubready-reports
-```
+# CSV-output scripts
+node -r dotenv/config completed-classes.js
 
-The CSV lands in `./output/completed-classes-YYYY-MM-DD.csv`.
-
-**Windows (PowerShell):**
-```powershell
-docker run --rm `
-  --env-file .env `
-  -v "${PWD}/output:/output" `
-  clubready-reports
-```
-
-### Passing credentials without a .env file
-
-```bash
-docker run --rm \
-  -e CLUBREADY_USER=pavan.katariya \
-  -e CLUBREADY_PASS="4@e9NtK#K*R3V*K8" \
-  -v "$(pwd)/output:/output" \
-  clubready-reports
+# MySQL-output scripts
+node -r dotenv/config lead-activity.js
 ```
 
 ---
 
-## Output
+## lead-activity.js
 
-- **stdout** — the full path to the saved CSV (used by automation tools like n8n)
-- **stderr** — progress logs (`Logging in...`, `Running report...`, etc.)
-- **exit code 1** — on any error, with a message on stderr
+Scrapes the Lead Management → Activity view for the previous day and bulk-inserts all rows into MySQL.
+
+### Navigation path
+
+```
+https://app.clubready.com/Dashboard/SalesProcess/LeadManagement
+  → click #tabactivity (Activity tab)
+  → click input[onclick="loadpreviousdate()"] (< button)
+  → select All Staff from dropdown
+  → extract table
+```
+
+### MySQL table
+
+```sql
+CREATE TABLE IF NOT EXISTS lead_management_activity (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  activity_date DATE         NOT NULL,
+  time          VARCHAR(20)  NOT NULL,
+  lead_name     VARCHAR(255) NOT NULL,
+  activity      VARCHAR(255) NOT NULL,
+  staff_name    VARCHAR(255) NOT NULL,
+  status        VARCHAR(100) NOT NULL,
+  scraped_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_activity (activity_date, time, lead_name(100), activity(100), staff_name(100))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### Key gotchas
+
+- **Column order** — ClubReady renders `Status | Time | Lead Name | Activity | Staff Name` (Status is first, not last)
+- **Table targeting** — the page has many tables (nav, sidebar, dropdowns). Filter rows by anchoring on `cells[1]` matching `/^\d{1,2}:\d{2}\s*(AM|PM)$/i` — this reliably identifies real data rows
+- **All Staff dropdown** — no reliable name/id attribute; found via fallback that scans all `<select>` elements for an option with text `All Staff`
+- **Bulk insert** — uses a single `INSERT IGNORE ... VALUES ?` with all rows; row-by-row inserts are too slow and will time out the SSH session
+- **stdout** — prints the count of inserted rows; n8n reads this as `$json.stdout`
+
+### n8n workflow
+
+```
+Schedule Trigger (daily 2:30am ET)  [ID: ZQVcU4pql3nGQ7gp]
+  → SSH: Run Script
+      command: cd /home/pkatariya/clubready-reports && node -r dotenv/config lead-activity.js
+      credential: SSH Tysons01
+```
 
 ---
 
-## Adding a New Report
+## Adding a New CSV Report
 
 ### 1. Find the report ID
 
@@ -87,8 +108,6 @@ cp completed-classes.js my-new-report.js
 
 ### 3. Update the selector and filename
 
-Change two things in the new script:
-
 ```javascript
 // Update the CSS class with the new report ID
 await page.waitForSelector('.menuItem93 a', { state: 'attached', timeout: 30000 });
@@ -98,17 +117,11 @@ await page.evaluate(() => document.querySelector('.menuItem93 a').click());
 const filename = `lost-members-${date}.csv`;
 ```
 
-### 4. Add it to the Dockerfile
-
-```dockerfile
-COPY my-new-report.js ./
-```
-
-And rebuild:
+### 4. Test it
 
 ```bash
-docker build -t clubready-reports .
-docker run --rm --env-file .env -v "$(pwd)/output:/output" clubready-reports node -r dotenv/config my-new-report.js
+cd ~/clubready-reports
+node -r dotenv/config my-new-report.js
 ```
 
 ---
@@ -134,13 +147,13 @@ After submitting, verify login succeeded by checking the URL redirected to `app.
 
 **Important:** The `.env` password must be quoted if it contains `#`, because dotenv treats `#` as a comment character.
 ```
-CLUBREADY_PASS="4@e9NtK#K*R3V*K8"   ✓
-CLUBREADY_PASS=4@e9NtK#K*R3V*K8     ✗  (truncated at #)
+CLUBREADY_PASS="your_password"   ✓
+CLUBREADY_PASS=your_password     ✗  (truncated at #)
 ```
 
 ---
 
-### Report Navigation
+### Report Navigation (SSRS reports)
 
 The Reports page (`/Reporting/ReportViewer`) renders a left sidebar where every report link has a predictable CSS class: `.menuItem{reportId}`.
 
@@ -148,14 +161,6 @@ Examples:
 - Classes Completed → `.menuItem60`
 - Lost Members → `.menuItem93`
 - Gross Sales → `.menuItem29`
-
-**Finding a report's ID:** Open the Reports page, right-click the report in the left nav, Inspect Element. You'll see something like:
-```html
-<li class="menuItem menuItem60 cr-sidenav-item-active">
-  <a href="javascript:loadReportParams(60, 0, '')">Classes Completed</a>
-</li>
-```
-The number in `menuItem{N}` and `loadReportParams({N}, ...)` is the report ID.
 
 **Clicking the menu item:** The sidebar is scrollable and items are often off-screen, so Playwright's normal `click()` fails with a visibility error. Use a JS click instead:
 ```javascript
@@ -192,7 +197,7 @@ const ssrsFrame = page.frames().find(f => f.url().includes('reportviewer.aspx'))
 
 ### Downloading as CSV (the export trick)
 
-Rather than clicking through the SSRS export dropdown (fragile), the script extracts the export base URL directly from the frame's JavaScript and fetches the CSV programmatically using the browser's session cookies:
+Rather than clicking through the SSRS export dropdown (fragile), extract the export base URL directly from the frame's JavaScript and fetch the CSV using the browser's session cookies:
 
 ```javascript
 const exportUrlBase = await ssrsFrame.evaluate(() => {
@@ -214,18 +219,13 @@ const response = await context.request.get(csvUrl);
 
 ---
 
-## n8n Workflow Architecture
+### stdout vs stderr
 
-```
-Schedule Trigger (daily 7am ET)
-  → SSH: Run Docker Container
-      command: docker run --rm --env-file /home/pkatariya/clubready-reports/.env \
-               -v /tmp/clubready-downloads:/output clubready-reports
-      → stdout: /output/completed-classes-YYYY-MM-DD.csv
-  → SSH: Download CSV from Server
-      path: ={{ $json.stdout.trim() }}
-  → Google Drive: Upload
-      folder: 1pPGf6hVCC47MwTSOQKXFb0mh37UZo95y
+All status messages go to **stderr**. Only the result (file path or row count) goes to **stdout**:
+
+```javascript
+const log = msg => process.stderr.write(msg + '\n');
+process.stdout.write(result); // clean value for n8n to read as $json.stdout
 ```
 
 ---
@@ -233,11 +233,41 @@ Schedule Trigger (daily 7am ET)
 ## File Structure
 
 ```
-.
-├── Dockerfile
-├── .dockerignore
-├── .env.example          # copy to .env and fill in credentials
-├── completed-classes.js  # Classes Completed by Member report
+~/clubready-reports/
+├── .env                    # credentials (never commit)
+├── .env.example
+├── completed-classes.js    # Classes Completed by Member → CSV
+├── booking-events.js       # Booking events → CSV
+├── frozen-members.js       # Frozen members → CSV
+├── member-list.js          # Member list → CSV
+├── lead-activity.js        # Lead Management Activity → MySQL
 ├── package.json
-└── package-lock.json
+└── node_modules/
 ```
+
+## Environment Variables (.env)
+
+```
+# ClubReady login (all scripts)
+CLUBREADY_USER=pavan.katariya
+CLUBREADY_PASS="..."         # quotes required — password contains #
+DOWNLOAD_DIR=/tmp/clubready-downloads
+
+# MySQL (lead-activity.js only)
+MYSQL_HOST=100.116.169.44
+MYSQL_PORT=49154
+MYSQL_USER=n8n
+MYSQL_PASS=n8n
+MYSQL_DB=n8n
+```
+
+---
+
+## n8n Workflows
+
+| Workflow | ID | Schedule |
+|---|---|---|
+| ClubReady — Completed Classes Daily Export | `cooaRBSaf9d6J4ER` | Daily 7am ET |
+| ClubReady — Lead Management Activity Daily Import | `ZQVcU4pql3nGQ7gp` | Daily 2:30am ET |
+
+All workflows SSH into `100.124.184.65` (credential: SSH Tysons01).
